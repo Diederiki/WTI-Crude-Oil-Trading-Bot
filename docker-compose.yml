@@ -1,0 +1,225 @@
+# =============================================================================
+# WTI Trading Bot - Docker Compose Configuration
+# =============================================================================
+# This compose file sets up the complete trading infrastructure including:
+# - PostgreSQL 16 for time-series data storage
+# - Redis 7 for caching and pub/sub messaging
+# - The trading bot application
+# =============================================================================
+
+version: "3.9"
+
+services:
+  # ===========================================================================
+  # PostgreSQL Database
+  # ===========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: wti-postgres
+    hostname: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${WTI_DATABASE__USER:-wti_user}
+      POSTGRES_PASSWORD: ${WTI_DATABASE__PASSWORD:-wti_password}
+      POSTGRES_DB: ${WTI_DATABASE__NAME:-wti_trading}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      # Performance tuning
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/init_schema.sql:/docker-entrypoint-initdb.d/01_init_schema.sql:ro
+    ports:
+      - "${WTI_DATABASE__PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${WTI_DATABASE__USER:-wti_user} -d ${WTI_DATABASE__NAME:-wti_trading}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - wti-network
+    command: >
+      postgres
+      -c max_connections=200
+      -c shared_buffers=256MB
+      -c effective_cache_size=768MB
+      -c maintenance_work_mem=64MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c work_mem=6553kB
+      -c min_wal_size=1GB
+      -c max_wal_size=4GB
+      -c log_statement=mod
+      -c log_duration=on
+      -c log_min_duration_statement=1000
+
+  # ===========================================================================
+  # Redis Cache & Pub/Sub
+  # ===========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: wti-redis
+    hostname: redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+      --save 60 10000
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${WTI_REDIS__PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - wti-network
+
+  # ===========================================================================
+  # Redis Commander (Optional - Redis UI)
+  # ===========================================================================
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: wti-redis-commander
+    restart: unless-stopped
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - wti-network
+    profiles:
+      - tools
+
+  # ===========================================================================
+  # Trading Bot Application
+  # ===========================================================================
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: wti-app
+    hostname: wti-app
+    restart: unless-stopped
+    environment:
+      # Override database URL for Docker networking
+      WTI_DATABASE__ASYNC_URL: postgresql+asyncpg://wti_user:wti_password@postgres:5432/wti_trading
+      WTI_DATABASE__SYNC_URL: postgresql://wti_user:wti_password@postgres:5432/wti_trading
+      # Override Redis URL for Docker networking
+      WTI_REDIS__URL: redis://redis:6379/0
+      WTI_REDIS__HOST: redis
+      # Ensure non-debug mode in container
+      WTI_DEBUG: "false"
+      WTI_ENVIRONMENT: production
+    env_file:
+      - .env
+    ports:
+      - "${WTI_API_PORT:-8000}:8000"
+      - "${WTI_METRICS__PORT:-9090}:9090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - wti-network
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # ===========================================================================
+  # Prometheus (Optional - Metrics Collection)
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: wti-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9091:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - wti-network
+    profiles:
+      - monitoring
+
+  # ===========================================================================
+  # Grafana (Optional - Visualization)
+  # ===========================================================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: wti-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - wti-network
+    profiles:
+      - monitoring
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  wti-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
